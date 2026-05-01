@@ -1,0 +1,356 @@
+---
+title: "Severe Weather Events in the United States: A Public Health and Economic Impact Analysis Using NOAA Storm Data (2025)"
+author: "Tyler Derkovitz"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+## Synopsis
+
+This report analyzes the U.S. National Oceanic and Atmospheric Administration (NOAA) Storm Database for the year 2025 to identify patterns in severe weather events and their consequences for public health and the economy. The dataset was assembled by joining three CSV files — event details, fatalities, and locations — using the shared `EVENT_ID` key. The analysis reveals that tornadoes, thunderstorm winds, and flash floods are the most frequent event types and among the most harmful to human health in terms of fatalities and injuries. Certain states, particularly those in the central and southeastern United States, experience disproportionately high storm activity. Monthly distribution of events shows a strong seasonal pattern, with storm activity peaking in the spring and summer months. A supplementary analysis examines the economic cost of weather events by state, revealing that property and crop damage is concentrated in a small number of high-impact event types. This report is intended to inform government and municipal managers responsible for emergency preparedness and resource allocation decisions.
+
+---
+
+## Data Processing
+
+### Loading Required Libraries
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(forcats)
+library(lubridate)
+library(tidyr)
+library(scales)
+library(knitr)
+```
+
+### Downloading and Loading the Data
+
+The data are sourced from NOAA's Storm Events database. Three CSV files for the year 2025 are used:
+
+- **Details**: Core event-level information (event type, location, health impacts, damage estimates)
+- **Fatalities**: Individual fatality records linked to events
+- **Locations**: Geographic location data for each event
+
+```{r load-data}
+
+
+folder_path <- "/Users/tylerderkovitz/Downloads/storm_data"
+
+details_file   <- file.path(folder_path, "StormEvents_details-ftp_v1.0_d2025_c20260323.csv.gz")
+fatalities_file <- file.path(folder_path, "StormEvents_fatalities-ftp_v1.0_d2025_c20260323.csv.gz")
+locations_file  <- file.path(folder_path, "StormEvents_locations-ftp_v1.0_d2025_c20260323.csv.gz")
+
+details    <- read_csv(details_file,    show_col_types = FALSE)
+fatalities <- read_csv(fatalities_file, show_col_types = FALSE)
+locations  <- read_csv(locations_file,  show_col_types = FALSE)
+```
+
+### Joining the Files
+
+The three files are linked by `EVENT_ID`. A left join is used so that all events in the details file are retained, even if they have no associated fatalities or location records.
+
+```{r join-data}
+joined_data <- details %>%
+  left_join(locations,   by = "EVENT_ID") %>%
+  left_join(fatalities,  by = "EVENT_ID")
+
+# Save the joined dataset for reference
+output_file <- file.path(folder_path, "StormEvents_joined_data.csv")
+write_csv(joined_data, output_file)
+message("Joined data saved to: ", output_file)
+
+# Preview
+glimpse(joined_data)
+```
+
+### Data Cleaning and Transformation
+
+```{r clean-data}
+# Standardize column names to uppercase for consistency
+names(joined_data) <- toupper(names(joined_data))
+
+# Parse the begin date and extract month
+# NOAA dates can appear as "01-JAN-25 00:00:00" or "1/1/2025 0:00:00"
+# We try multiple formats and fall back to BEGIN_YEARMONTH if needed
+joined_data <- joined_data %>%
+  mutate(
+    BEGIN_DATE_TIME_PARSED = parse_date_time(
+      BEGIN_DATE_TIME,
+      orders = c("dmy HMS", "mdy HMS", "dmy HM", "mdy HM", "dmy", "mdy"),
+      quiet = TRUE
+    ),
+    # If parse_date_time failed, extract month directly from BEGIN_YEARMONTH (format: YYYYMM)
+    MONTH_NUM = case_when(
+      !is.na(BEGIN_DATE_TIME_PARSED) ~ month(BEGIN_DATE_TIME_PARSED),
+      !is.na(BEGIN_YEARMONTH)        ~ as.integer(BEGIN_YEARMONTH) %% 100L,
+      TRUE                           ~ NA_integer_
+    ),
+    MONTH = month(MONTH_NUM, label = TRUE, abbr = TRUE)
+  )
+
+# Convert damage columns: handle suffix K (thousands), M (millions), B (billions)
+parse_damage <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  multiplier <- case_when(
+    grepl("K$", x) ~ 1e3,
+    grepl("M$", x) ~ 1e6,
+    grepl("B$", x) ~ 1e9,
+    TRUE            ~ 1
+  )
+  numeric_part <- as.numeric(gsub("[^0-9.]", "", x))
+  ifelse(is.na(numeric_part), 0, numeric_part * multiplier)
+}
+
+joined_data <- joined_data %>%
+  mutate(
+    DAMAGE_PROPERTY_NUM = parse_damage(DAMAGE_PROPERTY),
+    DAMAGE_CROPS_NUM    = parse_damage(DAMAGE_CROPS),
+    TOTAL_DAMAGE        = DAMAGE_PROPERTY_NUM + DAMAGE_CROPS_NUM,
+    INJURIES_DIRECT     = replace_na(INJURIES_DIRECT, 0),
+    INJURIES_INDIRECT   = replace_na(INJURIES_INDIRECT, 0),
+    DEATHS_DIRECT       = replace_na(DEATHS_DIRECT, 0),
+    DEATHS_INDIRECT     = replace_na(DEATHS_INDIRECT, 0),
+    TOTAL_INJURIES      = INJURIES_DIRECT + INJURIES_INDIRECT,
+    TOTAL_DEATHS        = DEATHS_DIRECT + DEATHS_INDIRECT
+  )
+
+cat("Rows in joined dataset:", nrow(joined_data), "\n")
+cat("Unique event types:", n_distinct(joined_data$EVENT_TYPE), "\n")
+cat("States covered:", n_distinct(joined_data$STATE), "\n")
+cat("Rows with valid MONTH:", sum(!is.na(joined_data$MONTH)), "\n")
+print(table(joined_data$MONTH, useNA = "ifany"))
+```
+
+---
+
+## Results
+
+### Question 1: Which Event Types Are Most Harmful to Population Health?
+
+Population health impact is measured by combining total fatalities and total injuries across all recorded events for each event type.
+
+```{r health-impact, fig.cap="Figure 1: Top 15 storm event types ranked by total population health impact (fatalities + injuries) in 2025. Tornadoes and thunderstorm winds consistently dominate health-related storm impacts."}
+
+health_summary <- joined_data %>%
+  group_by(EVENT_TYPE) %>%
+  summarise(
+    Total_Deaths   = sum(TOTAL_DEATHS,   na.rm = TRUE),
+    Total_Injuries = sum(TOTAL_INJURIES, na.rm = TRUE),
+    Total_Impact   = Total_Deaths + Total_Injuries,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Impact)) %>%
+  slice_head(n = 15) %>%
+  pivot_longer(cols = c(Total_Deaths, Total_Injuries),
+               names_to = "Impact_Type", values_to = "Count") %>%
+  mutate(EVENT_TYPE = fct_reorder(EVENT_TYPE, Count, .fun = sum))
+
+ggplot(health_summary, aes(x = Count, y = EVENT_TYPE, fill = Impact_Type)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("Total_Deaths" = "#c0392b", "Total_Injuries" = "#e67e22"),
+                    labels = c("Fatalities", "Injuries")) +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title    = "Top 15 Most Harmful Storm Event Types: Population Health Impact (2025)",
+    subtitle = "Stacked bars show fatalities (red) and injuries (orange)",
+    x        = "Total Count (Fatalities + Injuries)",
+    y        = "Event Type",
+    fill     = "Impact Type",
+    caption  = "Source: NOAA Storm Events Database, 2025"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+```
+
+**Interpretation:** The event types with the greatest population health impact are those that are both common and difficult to avoid, such as tornadoes, thunderstorm winds, flash floods, and heat events. Fatalities, though fewer in count than injuries, represent irreversible harm and deserve particular attention in emergency planning.
+
+---
+
+### Question 2: Which Event Types Occur Most Frequently in Which States?
+
+This analysis examines the geographic distribution of storm events. We identify the top event type per state by frequency.
+
+```{r events-by-state, fig.cap="Figure 2: Top 10 states by total number of storm events recorded in 2025. States in the central and southeastern U.S. tend to experience the highest event counts."}
+
+# Total events per state (top 15)
+state_totals <- joined_data %>%
+  filter(!is.na(STATE)) %>%
+  count(STATE, name = "Event_Count") %>%
+  arrange(desc(Event_Count)) %>%
+  slice_head(n = 15) %>%
+  mutate(STATE = fct_reorder(STATE, Event_Count))
+
+ggplot(state_totals, aes(x = Event_Count, y = STATE, fill = Event_Count)) +
+  geom_col() +
+  scale_fill_gradient(low = "#aed6f1", high = "#1a5276") +
+  scale_x_continuous(labels = comma) +
+  labs(
+    title   = "Top 15 States by Total Recorded Storm Events (2025)",
+    x       = "Number of Events",
+    y       = "State",
+    fill    = "Event Count",
+    caption = "Source: NOAA Storm Events Database, 2025"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+```
+
+```{r top-event-per-state, fig.cap="Figure 3: Most common storm event type in each of the top 15 states. This highlights how storm risk profiles differ by region and can guide state-level emergency preparedness priorities."}
+
+# Most common event type within top 15 states
+top_states <- state_totals$STATE
+
+state_event_type <- joined_data %>%
+  filter(STATE %in% levels(top_states)) %>%
+  count(STATE, EVENT_TYPE) %>%
+  group_by(STATE) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(STATE = factor(STATE, levels = levels(top_states)))
+
+ggplot(state_event_type, aes(x = n, y = STATE, fill = EVENT_TYPE)) +
+  geom_col() +
+  labs(
+    title   = "Most Frequent Storm Event Type per State (Top 15 States, 2025)",
+    x       = "Number of Occurrences",
+    y       = "State",
+    fill    = "Dominant Event Type",
+    caption = "Source: NOAA Storm Events Database, 2025"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9),
+        plot.title = element_text(face = "bold")) +
+  guides(fill = guide_legend(nrow = 3))
+```
+
+**Interpretation:** Storm frequency varies substantially by state. States with large geographic areas or those situated in climatologically active zones (such as tornado alley or the Gulf Coast) tend to record higher event counts. The dominant event type in each state reflects its regional climate profile and should shape local emergency preparedness investments.
+
+---
+
+### Question 3: Which Event Types Are Characterized by Which Months?
+
+This analysis explores the seasonal timing of different storm event types.
+
+```{r seasonal-patterns, fig.cap="Figure 4: Monthly distribution of the top 10 most frequent storm event types. Clear seasonal patterns emerge, with most event types peaking in spring and summer months."}
+
+# Top 10 event types overall
+top_events <- joined_data %>%
+  count(EVENT_TYPE, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(EVENT_TYPE)
+
+monthly_dist <- joined_data %>%
+  filter(EVENT_TYPE %in% top_events, !is.na(MONTH)) %>%
+  count(EVENT_TYPE, MONTH, MONTH_NUM) %>%
+  mutate(EVENT_TYPE = factor(EVENT_TYPE, levels = top_events))
+
+ggplot(monthly_dist, aes(x = MONTH, y = n, fill = EVENT_TYPE)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ EVENT_TYPE, scales = "free_y", ncol = 2) +
+  labs(
+    title   = "Monthly Distribution of Top 10 Storm Event Types (2025)",
+    x       = "Month",
+    y       = "Number of Events",
+    caption = "Source: NOAA Storm Events Database, 2025"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+**Interpretation:** Seasonal patterns are strongly evident in the data. Thunderstorm winds and tornadoes peak in spring and early summer, consistent with atmospheric instability during those months. Winter storms naturally concentrate in December through February. Understanding these seasonal windows is essential for pre-positioning emergency resources and staffing.
+
+---
+
+### Question 4: Which States Incur the Greatest Economic Damage from Storm Events?
+
+Beyond human health, severe weather causes substantial economic damage through property destruction and crop losses. This question examines total economic losses by state.
+
+```{r economic-damage, fig.cap="Figure 5: Total estimated economic damage (property + crop) by state for the top 15 highest-impact states in 2025. A small number of states account for the majority of storm-related economic losses."}
+
+damage_by_state <- joined_data %>%
+  filter(!is.na(STATE)) %>%
+  group_by(STATE) %>%
+  summarise(
+    Total_Property_Damage = sum(DAMAGE_PROPERTY_NUM, na.rm = TRUE),
+    Total_Crop_Damage     = sum(DAMAGE_CROPS_NUM,    na.rm = TRUE),
+    Total_Damage          = Total_Property_Damage + Total_Crop_Damage,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Damage)) %>%
+  slice_head(n = 15) %>%
+  pivot_longer(cols = c(Total_Property_Damage, Total_Crop_Damage),
+               names_to = "Damage_Type", values_to = "Amount") %>%
+  mutate(STATE = fct_reorder(STATE, Amount, .fun = sum))
+
+ggplot(damage_by_state, aes(x = Amount, y = STATE, fill = Damage_Type)) +
+  geom_col(position = "stack") +
+  scale_x_continuous(labels = label_dollar(scale = 1e-6, suffix = "M")) +
+  scale_fill_manual(values = c("Total_Property_Damage" = "#2980b9",
+                                "Total_Crop_Damage"     = "#27ae60"),
+                    labels = c("Property Damage", "Crop Damage")) +
+  labs(
+    title   = "Top 15 States by Total Storm-Related Economic Damage (2025)",
+    subtitle = "Stacked bars show property (blue) and crop (green) damage",
+    x       = "Total Estimated Damage (Millions USD)",
+    y       = "State",
+    fill    = "Damage Type",
+    caption = "Source: NOAA Storm Events Database, 2025"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+```
+
+**Interpretation:** Economic damage from severe weather is highly concentrated in a few states, often driven by a handful of large-scale events such as major floods or tornadoes. Property damage consistently outweighs crop damage in dollar terms, though agricultural communities may experience crop losses as a more directly life-altering impact. This information can guide federal and state-level infrastructure investment and disaster relief pre-funding.
+
+---
+
+## Summary Table
+
+```{r summary-table}
+summary_tbl <- joined_data %>%
+  group_by(EVENT_TYPE) %>%
+  summarise(
+    Events      = n(),
+    Deaths      = sum(TOTAL_DEATHS,   na.rm = TRUE),
+    Injuries    = sum(TOTAL_INJURIES, na.rm = TRUE),
+    Damage_USD  = sum(TOTAL_DAMAGE,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Events)) %>%
+  slice_head(n = 10) %>%
+  mutate(Damage_USD = dollar(Damage_USD))
+
+kable(summary_tbl,
+      col.names = c("Event Type", "# Events", "Deaths", "Injuries", "Total Damage"),
+      caption   = "Table 1: Top 10 most frequent storm event types and their health/economic impacts (2025)",
+      align     = c("l", "r", "r", "r", "r"))
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
